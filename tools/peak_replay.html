@@ -111,6 +111,7 @@
       <h1>RSSI Peak Replay</h1>
       <div class="meta">Upload receiver CSV, adjust filtering and peak rules, then compare detected peak time.</div>
     </div>
+    <nav><a href="/" onclick="history.back(); return false;">Back</a></nav>
   </header>
 
   <div class="toolbar">
@@ -118,6 +119,9 @@
       CSV file
       <input id="fileInput" type="file" accept=".csv,text/csv">
     </label>
+    <button id="loadEsp32Button" type="button">Load from ESP32</button>
+    <button id="saveFiltersButton" type="button">Save filter settings</button>
+    <button id="loadDefaultFiltersButton" type="button">Load Factory Filter Settings</button>
     <label>
       SMA samples <output id="avgOut">3</output>
       <input id="avgInput" type="range" min="1" max="12" value="3">
@@ -155,125 +159,6 @@
   </div>
 
   <script>
-    class PeakDetector {
-      constructor() {
-        this.configure({
-          movingAverageMeasurements: 3,
-          emaAlphaPercent: 50,
-          peakArmRiseDb: 6,
-          peakDropDb: 5,
-          requiredDropReadings: 3,
-          learnMode: false
-        });
-        this.reset(0);
-      }
-
-      configure(config) {
-        this.config = {
-          movingAverageMeasurements: clampInt(config.movingAverageMeasurements, 1, 12),
-          emaAlphaPercent: clampInt(config.emaAlphaPercent, 1, 100),
-          peakArmRiseDb: clampInt(config.peakArmRiseDb, 1, 30),
-          peakDropDb: clampInt(config.peakDropDb, 1, 30),
-          requiredDropReadings: Math.max(1, clampInt(config.requiredDropReadings, 1, 20)),
-          learnMode: Boolean(config.learnMode)
-        };
-      }
-
-      reset(startMs) {
-        this.recent = new Array(12).fill(0);
-        this.recentCount = 0;
-        this.recentNext = 0;
-        this.hasRssiValue = false;
-        this.emaReady = false;
-        this.smaValue = -100;
-        this.smoothValue = -100;
-        this.baselineValue = -100;
-        this.peakValue = -100;
-        this.peakMsValue = startMs;
-        this.dropReadingCount = 0;
-        this.armed = false;
-      }
-
-      process(timeMs, rawRssi) {
-        this.smaValue = this.movingAverage(rawRssi);
-        if (!this.emaReady) {
-          this.smoothValue = this.smaValue;
-          this.emaReady = true;
-        } else {
-          const alpha = this.config.emaAlphaPercent / 100;
-          this.smoothValue = alpha * this.smaValue + (1 - alpha) * this.smoothValue;
-        }
-
-        if (!this.hasRssiValue) {
-          this.hasRssiValue = true;
-          this.baselineValue = this.smoothValue;
-          this.peakValue = this.smoothValue;
-          this.peakMsValue = timeMs;
-          return this.result(rawRssi, false);
-        }
-
-        if (this.smoothValue >= this.peakValue) {
-          this.peakValue = this.smoothValue;
-          this.peakMsValue = timeMs;
-          if ((this.peakValue - this.baselineValue) >= this.config.peakArmRiseDb) {
-            this.armed = true;
-          }
-          this.dropReadingCount = 0;
-          return this.result(rawRssi, false);
-        }
-
-        if (!this.armed) {
-          return this.result(rawRssi, false);
-        }
-
-        if ((this.peakValue - this.smoothValue) >= this.config.peakDropDb) {
-          this.dropReadingCount++;
-        } else if (this.dropReadingCount > 0) {
-          this.dropReadingCount--;
-        }
-
-        const detected = this.dropReadingCount >= this.config.requiredDropReadings;
-        const output = this.result(rawRssi, detected);
-        if (detected && this.config.learnMode) {
-          this.baselineValue = this.smoothValue;
-          this.peakValue = this.smoothValue;
-          this.peakMsValue = timeMs;
-          this.armed = false;
-          this.dropReadingCount = 0;
-        }
-        return output;
-      }
-
-      movingAverage(rawRssi) {
-        this.recent[this.recentNext] = rawRssi;
-        this.recentNext = (this.recentNext + 1) % this.config.movingAverageMeasurements;
-        if (this.recentCount < this.config.movingAverageMeasurements) {
-          this.recentCount++;
-        }
-
-        let total = 0;
-        for (let i = 0; i < this.recentCount; i++) {
-          total += this.recent[i];
-        }
-        return total / this.recentCount;
-      }
-
-      result(rawRssi, peakDetected) {
-        return {
-          hasRssi: this.hasRssiValue,
-          peakDetected,
-          rawRssi,
-          smaRssi: this.smaValue,
-          smoothRssi: this.smoothValue,
-          baselineRssi: this.baselineValue,
-          currentPeakRssi: this.peakValue,
-          currentPeakMs: this.peakMsValue,
-          dropReadings: this.dropReadingCount,
-          peakArmed: this.armed
-        };
-      }
-    }
-
     const state = {
       fileName: '',
       rows: [],
@@ -284,8 +169,13 @@
       wasmModule: null,
       wasmApi: null,
       wasmLoaded: false,
-      detectorSource: 'JS fallback'
+      detectorSource: 'C++ WASM'
     };
+
+    const urlParams = new URLSearchParams(window.location.search);
+    const requestedRunSequence = urlParams.get('run');
+    const savedFiltersKey = 'wifiTimerPeakReplayFilters';
+    const defaultFilterSettings = { avg: 3, ema: 50, rise: 6, drop: 5, dropReadings: 3 };
 
     const graph = document.getElementById('graph');
     const statusEl = document.getElementById('status');
@@ -380,6 +270,7 @@
       }
 
       const header = splitCsvLine(lines[0]).map(name => name.trim());
+      const runSequenceColumn = header.indexOf('run_sequence');
       const timeColumn = header.indexOf('time_ms');
       const secondsColumn = header.indexOf('seconds');
       let rawColumn = header.indexOf('raw_rssi');
@@ -392,6 +283,10 @@
       for (let i = 1; i < lines.length; i++) {
         const cells = splitCsvLine(lines[i]);
         if (cells.length <= rawColumn) continue;
+        if (requestedRunSequence && runSequenceColumn >= 0 &&
+            (cells.length <= runSequenceColumn || cells[runSequenceColumn] !== requestedRunSequence)) {
+          continue;
+        }
 
         const rawRssi = Number(cells[rawColumn]);
         if (!Number.isFinite(rawRssi)) continue;
@@ -414,7 +309,9 @@
       }
 
       if (rows.length === 0) {
-        throw new Error('No valid RSSI rows found.');
+        throw new Error(requestedRunSequence
+          ? `No valid rows found for run ${requestedRunSequence}.`
+          : 'No valid RSSI rows found.');
       }
       rows.sort((a, b) => a.timeMs - b.timeMs);
       return rows;
@@ -431,23 +328,44 @@
       };
     }
 
-    function replayWithJsDetector(config) {
-      const detector = new PeakDetector();
-      detector.configure(config);
-      detector.reset(state.rows.length ? state.rows[0].timeMs : 0);
-
-      for (const row of state.rows) {
-        const result = detector.process(row.timeMs, row.rawRssi);
-        recordDetectorResult(row, result);
+    function applySavedFilterSettings() {
+      try {
+        const saved = JSON.parse(localStorage.getItem(savedFiltersKey) || '{}');
+        if (Number.isFinite(saved.avg)) controls.avg.value = clampInt(saved.avg, 1, 12);
+        if (Number.isFinite(saved.ema)) controls.ema.value = clampInt(saved.ema, 1, 100);
+        if (Number.isFinite(saved.rise)) controls.rise.value = clampInt(saved.rise, 1, 30);
+        if (Number.isFinite(saved.drop)) controls.drop.value = clampInt(saved.drop, 1, 30);
+        if (Number.isFinite(saved.dropReadings)) controls.dropReadings.value = clampInt(saved.dropReadings, 1, 20);
+      } catch (error) {
+        console.warn('Failed to restore saved filter settings:', error);
       }
-      state.detectorSource = 'JS fallback';
+    }
+
+    function saveFilterSettings() {
+      const saved = {
+        avg: clampInt(controls.avg.value, 1, 12),
+        ema: clampInt(controls.ema.value, 1, 100),
+        rise: clampInt(controls.rise.value, 1, 30),
+        drop: clampInt(controls.drop.value, 1, 30),
+        dropReadings: clampInt(controls.dropReadings.value, 1, 20)
+      };
+      localStorage.setItem(savedFiltersKey, JSON.stringify(saved));
+      rerender();
+    }
+
+    function loadDefaultFilterSettings() {
+      controls.avg.value = defaultFilterSettings.avg;
+      controls.ema.value = defaultFilterSettings.ema;
+      controls.rise.value = defaultFilterSettings.rise;
+      controls.drop.value = defaultFilterSettings.drop;
+      controls.dropReadings.value = defaultFilterSettings.dropReadings;
+      rerender();
     }
 
     function replayWithWasmDetector(config) {
       const api = wasmApi();
       if (!api) {
-        replayWithJsDetector(config);
-        return;
+        throw new Error('WASM peak detector is not loaded. Serve this page over HTTP with peak_detector_wasm.js available.');
       }
 
       const handle = api.create();
@@ -519,10 +437,13 @@
       state.armedAt = null;
 
       const config = currentConfig();
-      if (state.wasmLoaded) {
+      try {
         replayWithWasmDetector(config);
-      } else {
-        replayWithJsDetector(config);
+      } catch (error) {
+        state.points = [];
+        state.peak = null;
+        state.armedAt = null;
+        state.error = error.message || String(error);
       }
     }
 
@@ -780,10 +701,44 @@
       rerender();
     });
 
+    async function loadEsp32Runs() {
+      try {
+        const response = await fetch('/runs.csv?ts=' + Date.now());
+        if (!response.ok) throw new Error(`Failed to load /runs.csv: HTTP ${response.status}`);
+        const text = await response.text();
+        state.fileName = requestedRunSequence ? `/runs.csv run ${requestedRunSequence}` : '/runs.csv';
+        state.rows = parseCsv(text);
+        state.error = '';
+      } catch (error) {
+        state.fileName = requestedRunSequence ? `/runs.csv run ${requestedRunSequence}` : '/runs.csv';
+        state.rows = [];
+        state.points = [];
+        state.peak = null;
+        state.armedAt = null;
+        state.error = error.message || String(error);
+      }
+      rerender();
+    }
+
+    document.getElementById('loadEsp32Button').addEventListener('click', loadEsp32Runs);
+    document.getElementById('saveFiltersButton').addEventListener('click', saveFilterSettings);
+    document.getElementById('loadDefaultFiltersButton').addEventListener('click', loadDefaultFilterSettings);
+
     Object.values(controls).forEach(input => input.addEventListener('input', rerender));
+    applySavedFilterSettings();
     rerender();
+    if (window.location.hostname === '192.168.4.1') {
+      loadEsp32Runs();
+    }
     loadWasmDetector().then(module => {
-      if (!module) return;
+      if (!module) {
+        state.wasmLoaded = false;
+        state.error = window.location.protocol === 'file:'
+          ? 'WASM peak detector requires HTTP. Run make serve-peak-replay or use the ESP32 replay page.'
+          : 'Failed to load WASM peak detector.';
+        rerender();
+        return;
+      }
       state.wasmModule = module;
       state.wasmLoaded = true;
       state.detectorSource = 'C++ WASM';

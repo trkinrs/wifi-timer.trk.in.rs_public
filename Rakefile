@@ -4,6 +4,17 @@ require "fileutils"
 require "shellwords"
 require "tmpdir"
 
+if File.file?(".env")
+  File.foreach(".env") do |line|
+    key, value = line.strip.split("=", 2)
+    next if key.to_s.empty? || key.start_with?("#") || value.nil?
+
+    value = value.strip
+    value = value[1...-1] if value.length >= 2 && value.start_with?("\"", "'") && value.end_with?("\"", "'")
+    ENV[key] ||= value
+  end
+end
+
 GITHUB_PAGES_BRANCH = "gh-pages"
 PLATFORM = "--platform linux/amd64"
 JEKYLL_IMAGE = "jekyll/jekyll:latest"
@@ -16,6 +27,7 @@ def sync_changed_files(source_dir, target_dir)
     .reject { |path| [ ".", ".." ].include? File.basename(path) }
     .reject { |path| File.directory?(path) }
     .map { |path| path.delete_prefix("#{source_dir}/") }
+    .reject { |path| path == ".github/actions" || path.start_with?(".github/actions/") }
 
   target_paths = Dir.glob("#{target_dir}/**/*", File::FNM_DOTMATCH)
     .reject { |path| [ ".", ".." ].include? File.basename(path) }
@@ -61,9 +73,23 @@ end
 
 desc "Commit source code to main, rebase, and push"
 task :commit_and_push_with_rebase do
-  sh "git add ."
-  sh %(git commit -m "Update source site content" || echo 'Nothing to commit on main')
-  sh "git pull --rebase || echo 'cannot rebase, probably no main branch on remote yet'"
+  rebase_in_progress = File.directory?(File.join(REPO_DIR, ".git", "rebase-merge")) ||
+    File.directory?(File.join(REPO_DIR, ".git", "rebase-apply"))
+
+  if rebase_in_progress
+    sh "git add ."
+    sh "GIT_EDITOR=true git rebase --continue"
+  else
+    sh "git add ."
+    sh %(git commit -m "Update source site content" || echo 'Nothing to commit on main')
+
+    if system("git ls-remote --exit-code --heads origin main >/dev/null 2>&1")
+      sh "git pull --rebase origin main"
+    else
+      puts "No main branch on remote yet; skipping pull."
+    end
+  end
+
   sh "git push origin main"
 end
 
@@ -71,7 +97,7 @@ desc "Deploy to #{GITHUB_PAGES_BRANCH} branch using a cached checkout (does not 
 task :deploy do
   origin = `git config --get remote.origin.url`.strip
   fail "origin is empty" if origin.empty?
-  pages_origin = ENV["GH_PAGES_REPO_URL"].to_s.strip
+  pages_origin = ENV["GH_PAGES_REPO_URL_IF_DIFFERENT_FROM_REPO_URL"].to_s.strip
   pages_origin = origin if pages_origin.empty?
   pages_origin_arg = Shellwords.escape(pages_origin)
 
@@ -110,7 +136,12 @@ task :deploy do
       sh "git remote set-url origin #{pages_origin_arg}"
       current_branch = `git branch --show-current`.strip
       sh "git checkout #{GITHUB_PAGES_BRANCH}" unless current_branch == GITHUB_PAGES_BRANCH
-      sh "git pull --ff-only origin #{GITHUB_PAGES_BRANCH}" unless pages_checkout_created
+      unless pages_checkout_created
+        # The generated site is authoritative; discard local divergence in the
+        # cached checkout before syncing _site files.
+        sh "git fetch origin #{GITHUB_PAGES_BRANCH}"
+        sh "git reset --hard origin/#{GITHUB_PAGES_BRANCH}"
+      end
 
       sync_changed_files build_dir, PAGES_DIR
 
@@ -123,7 +154,7 @@ task :deploy do
       sh "git commit -m 'Site updated at #{Time.now.utc}'"
 
       puts "Pushing to #{pages_origin}"
-      sh "git push origin #{GITHUB_PAGES_BRANCH}"
+      sh "git push --force-with-lease origin #{GITHUB_PAGES_BRANCH}"
     end
   end
 end
